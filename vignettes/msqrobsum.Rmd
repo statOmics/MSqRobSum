@@ -1,0 +1,395 @@
+---
+title: "MSqRobSum"
+author: "Adriaan Sticker"
+date: "`r Sys.Date()`"
+output:
+   html_vignette:
+    toc: true
+    number_sections: true
+   fig_caption: yes
+#  pdf_document: default
+#bibliography: bib.bib
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+<!-- devtools::install('/home/st/Dropbox/summarisation/msqrobsum/', build = TRUE) -->
+# Introduction
+Label-Free Quantitative mass spectrometry based workflows for differential expression (DE) analysis of proteins is often challenging due to peptide-specific effects and context-sensitive missingness of peptide intensities.
+Peptide-based workflows, like MSqRob, test for DE directly from peptide intensities and outperform summarisation methods which first aggregate MS1 peptide intensities to protein intensities before DE analysis.
+However, they are computationally expensive, often hard to understand for the non-specialised end-user, and they do not provide protein summaries, which are important for visualisation or downstream processing.
+We propose a novel summarisation strategy, MSqRobSum, which estimates MSqRob's model parameters in a two-stage procedure circumventing the drawbacks of peptide-based workflows.
+MSqRobSum maintains MSqRob's superior performance, while providing useful protein expression summaries for plotting and downstream analysis. 
+Summarising peptide to protein intensities considerably reduces the computational complexity, the memory footprint and the model complexity. 
+Moreover, MSqRobSum renders the analysis framework to become modular, providing users the flexibility to develop workflows tailored towards specific applications.
+
+In this vignette we will demonstrate how to perform a Differential Expression analysis using `msqrobsum` starting from the result of a Maxquant search.
+
+# Data set
+To demonstrate a MSqRob or MSqRobSum workflow for differential expression analysis, we use a publically available benchmark dataset (PRIDE identifier: PXD003881). 
+Here, /E. Coli/ lysates were spiked at 5 different concentrations (3%, 4.5%, 6%, 7.5% and 9% wt/wt)in a stable human background (4 replicates/treatment).
+The 20 samples were subsequently run on a Orbitrap Fusion MS mass spectrometer and processed with Maxquant.
+The spectra were searched against the Swissprot human and /E. Coli/ reference proteome database (07/06/2018) next to the default Maxquant contaminant database. 
+The resulting peptide-to-spectrum matches (PSMs) were filtered by Maxquant at 1% FDR.
+We can label the /E.coli/ proteins as Differentially expressed (DE) (true positives) and all human proteins as non DE (true negatives). 
+We can consider this the ground truth and use this labeling to check the performance of our analysis.
+
+# Reading peptide intensity data in R
+We will use the `MSnBase` package to read peptide intensities from  MaxQuant's `peptides.txt` file into a MSnSet object.
+Internally a MSnSet object represents the data as a matrix of peptide intensities. Every collumn  is a different sample and every row is a different peptide.
+Extra information about the samples and the peptides are addes as featureData and pheno dataframe objects.
+
+```{r, cache= TRUE}
+time_a = Sys.time()
+## Load the MSnBase library
+library(MSnbase)
+## Location of the Maxquant output file
+data_path = system.file('extdata','peptides.txt.gz', package = 'msqrobsum')
+## file is compressed with gzip (hence '.gz' extention), thus first make connection
+data_path = gzfile(data_path)
+## Look for the columns with peptide intensities in the maxquant output (columns starting with `Intensity `, 1 column for every sample.)
+exprs_col = grepEcols(data_path, 'Intensity ',split = '\t')
+## read data into a MSnSet object. The different peptides are indicated in the `Sequence` column.
+## All other columns were added as a featureData dataframe in the MSnSet object 
+set = readMSnSet2(data_path ,ecol = exprs_col,fnames = 'Sequence'
+                  , sep = '\t',stringsAsFactors = FALSE)
+set
+```
+
+
+We will add some extra usefull information to this object to make the downstream data analysis easier. Usefull functions for easier 'data wrangling' reside in the `tidyverse` package.
+The proteins are labeled by MaqQaunt with their Uniprot identifier (eg. `P55011`)
+However peptides shared by multiple proteins are assigned to so-called protein groups.
+Protein groups are labeled with all Uniprot identifiers of the proteins sharing that peptide, separated with a `;` (eg. `P0DMV9;P0DMV8`).
+```{r, cache= TRUE}
+suppressPackageStartupMessages(library(tidyverse))
+
+## Remove redundant words in sample names
+sampleNames(set) = str_replace(sampleNames(set),'Intensity.','')
+
+## We take the featureData and only keep the following info:
+## to which protein(group) the pepide belongs,
+## if it was labeled as an contaminant protein by Maxquant ('CON_' added to protein id)
+## and if the peptide was from a reverse (decoy protein)
+fd = fData(set) %>%
+      transmute(protein = Proteins
+          , contaminant = grepl('CON_',protein)
+          , reverse = Reverse == '+')
+ 
+## We also add extra sample information as a phenoData dataframe object
+## We parse from the samplenames the info of to which condition the sample belongs (first letter)
+pd = data.frame(condition = as.factor(str_extract(sampleNames(set),'^.')))
+
+## We need to add to correct rownames to these dataframe so MSnBase can link it to the rows and columns of the expression matrix object in the MSnSet
+rownames(fd) = featureNames(set)
+rownames(pd) = sampleNames(set)
+## add it to the MSnSet object.
+fData(set) = fd
+pData(set) = pd
+set
+```
+Some proteins (and thus also their peptides) are only identified with a modification.
+This information however cannot be found in `peptides.txt` but in Maxquant's `proteinGroups.txt` file, which contains information for every protein found by the MaqQuant search. 
+
+Note that MaxQuant defines the protein groups sometimes different in the `proteinGroups.txt` in the `peptide.txt` file, so we should be carefull when adding information from the `proteinGroups.txt`.
+To cope with this we split the protein groups in the `proteinGroups.txt` up in their individual proteins which we then map  back to the protein groups defined in the `peptides.txt` file (and in our MSnSet object).
+```{r, cache= TRUE}
+## Location of the Maxquant output file
+path_proteinGroups = system.file('extdata','proteinGroups.txt.gz', package = 'msqrobsum')
+prot = read_tsv(path_proteinGroups) %>%
+  ## get the info of proteins only identified with a modification
+    transmute(site_only = !is.na(`Only identified by site`)
+              ## split the protein groups
+            , proteins = strsplit(`Protein IDs`,';')) %>%
+    unnest
+
+## map this to the peptide info in the MSnSet object
+fd = fData(set)
+fd = fd %>% transmute(protein, proteins = strsplit(protein,';')) %>%
+    unnest %>% left_join(prot, by = 'proteins') %>% select(-proteins) %>%
+    group_by(protein) %>% summarise_all(any) %>%
+    left_join(fd,., by = 'protein')
+rownames(fd) = featureNames(set)
+fData(set) = fd
+set
+```
+Since we work with a benchmark dataset where E. coli proteins are spiked into a stable human background, it would also be usefull to add species information to each protein(group) belongs. 
+We get this information from the fasta headers of the fasta files used for the Maxquant search.
+A seperate fasta file was used for the E. coli and Human proteins. We match the protein identifiers in the MaxQuant output with the ones found in the fasta headers.
+This allows us to label a protein as E. coli or human.
+
+You may have noticed that these fasta headers are allready present in the default MaxQuant `proteinGroups.txt` output file. However we noticed that there are sometimes more protein IDs then fasta headers reported for a protein group.
+Since the identity of these protein IDs is ambiguous, we opted to link the protein IDs to the fasta headers ourself.
+
+```{r, cache= TRUE}
+## Name of the compressed fasta files
+id = list(ecoli = 'ecoli_up000000625_7_06_2018.fasta.gz',
+          human = 'human_up000005640_sp_7_06_2018.fasta.gz') %>%
+  ## read the fasta and parse protein id from the fasta headers
+  map(~{system.file('extdata',.x, package = 'msqrobsum') %>%
+      read_lines %>%
+      ## take header
+      {.[str_detect(.,'^>')]} %>%
+      ## take protein id
+      str_extract(.,'(?<=\\|).*(?=\\|)')})
+
+## map these protein id to the protein groups in featureData object.
+fd = fData(set)
+fd = fd %>% transmute(protein = as.character(protein), proteins = strsplit(protein, ';')) %>%
+  unnest %>%
+  mutate(human = proteins %in% id$human, ecoli =  proteins %in% id$ecoli) %>% 
+  group_by(protein) %>%
+  summarise(human = any(human), ecoli = any(ecoli)) %>%
+    right_join(fd, by = 'protein') %>% as.data.frame
+
+rownames(fd) = featureNames(set)
+fData(set) = fd
+set
+```
+
+# Preprocessing
+Once the data is in a MSnSet object we can easily use all the functionality from MSnbase to process and visualize our data.
+Below we show the preprocessing used in the MSqRobSum paper.
+Preprocessing is an important step in the data analysis workflow and can be tailored to your data and needs. 
+
+Peptides with zero intensities are missing peptides and should be represent with a `NA` value instead of `0`. 
+```{r, cache= TRUE}
+  exprs(set)[0 == (exprs(set))] <- NA
+```
+We can inspect the missingness in our data with the `naplot()` and `plotNA()` function provided with `MSnbase`.
+77% of all peptide intensities are missing and for some peptides we don't even measure a signal in any sample. The missingness is similar across samples.
+```{r, cache= TRUE}
+plotNA(set)
+naplot(set)
+```
+
+We transform the peptide intensities into log space.
+```{r, cache= TRUE}
+  set_log = log(set, base = 2)
+```
+
+We can visualize our data using a Multi Dimensional Scaling plot, eg. as provided by the `limma` package.
+
+```{r, cache= TRUE}
+library(limma)
+plotMDS(exprs(set_log), top = Inf,col = as.integer(pData(set)$condition))
+plotDensities(exprs(set_log))
+```
+
+The leading variance according the MDS plot is not due to the different spike-in concentrations (condition a, b ,c ,d, e) but due to a unknown batch effect.
+The MDS plot seem to group the samples in two batches irrespective of their E. Coli spike in concentration.
+
+When we look at density plots of the log intensities, we see a clear shift in distribution for some samples.
+```{r, cache= TRUE}
+plotMDS(exprs(set_log), top = Inf,col = as.integer(pData(set)$condition))
+```
+
+This indicates that for some samples all measured peptide intensities are higher or lower (eg. due to different sample preparation, different machine settings, ...)
+This can potentially explain the batch effect we noticed in the MDS plot.
+
+## normalization
+A potential way to remedy sample effects is normalization the intensities for each sample.
+
+Here we perform VSN normalization using `MSnbase`.
+Note that VSN normalised values are on the log scale and we should normalize starting from the raw intensity values.
+```{r, cache= TRUE}
+set = normalize(set, 'vsn')
+```
+
+We look again at the MDS and density plots.
+```{r, cache= TRUE}
+plotMDS(exprs(set), top = Inf,col = as.integer(pData(set)$condition)) 
+plotDensities(exprs(set))
+```
+
+We see according the MDS plot that the leading variance is now best explaind by differences in spike-in concentration.
+However, the batch effect is not completely removed but it's effect is reduced.
+
+## Filtering of ubiquitous proteins
+Some peptides are shared between different proteins, eg. between isoforms or proteins with conserved domains. We say that such a peptide belongs to a protein group.
+How we handle these shared peptides can impact protein inference.
+However, there is no concensus in the literature on what the best strategy is to handle shared peptides.
+
+We adopt the strategy proposed in the MSqRob workflow, which filters out all peptides belonging to a protein group of which some of the member proteins belong to a smaller protein group.
+So if a peptide is shared between a number of proteins and seccond peptide is shared between the same proteins and a new protein, we remove this seccond peptide from the data because it's identity is ubiquitous.
+```{r, cache= TRUE}
+groups = tibble(protein = fData(set)$protein) %>% distinct %>%
+  ## count the number of proteins in a protein group
+    mutate(proteins = strsplit(protein, ';'), n = lengths(proteins)) %>% unnest %>%
+  ## Check for every protein what the smallest protein group is, it belongs to
+  ## remove larger protein groups
+    group_by(proteins) %>% filter(n == min(n)) %>% ungroup %>%
+    count(protein,n) %>% filter(n == nn) %>% pull(protein)
+
+set <- set[fData(set)$protein %in% groups, ]
+```
+
+Remove also peptides belonging to decoys, contaminants and those that are only identified with a modification.
+We remove also the peptides that have both human and E. coli protiens in their protein group.
+```{r, cache= TRUE}
+set <- set[!fData(set)$reverse]
+set <- set[!fData(set)$contaminant]
+set <- set[!fData(set)$site_only]
+set <- set[!(fData(set)$human & fData(set)$ecoli)]
+set
+```
+
+For each condition we have 4 replicates.
+But due to the missingness, some proteins only have measured intensities in 1 sample.
+For these proteins we cannot know if any change in the measured intensity is due to a sample or condition effect.
+Therefore, we choose to remove these samples for these proteins.
+For similar reasons we also remove peptides that are measured in only 1 sample.
+Since each of these two filter steps can have an impact on other filter step, we iterate between the two until no more peptides or samples are filtered out.
+```{r, cache= TRUE}
+library(msqrobsum)
+## filter out conditions that have not at least 2 samples
+### make them NA in msnset object
+## and remove peptides with less then 2 observations
+###########################################################
+while(TRUE) {
+  ## function to convert msnset to a dataframe
+    df = MSnSet2df(set)
+    ## check for conditions that have less then 2 samples
+    id <- df %>%  group_by(protein,condition) %>% summarise(n = length(unique(sample))) %>%
+        filter(n < 2) %>% ungroup %>% select(protein, condition) %>%
+        left_join(df, by = c('protein', 'condition')) %>% select(feature,sample)
+    ## If nothing is flagged for removal, stop
+    if(nrow(id) ==0) break
+    ## replace intensities with NA for these samples
+    exprs(set)[as.matrix(id)] = NA
+    ## and remove peptides with less then 2 observations
+set <- set[rowSums(!is.na(exprs(set))) >= 2]
+}
+set
+```
+
+# Summarization
+Next we summarize the measured peptide intensities to protein summaries.
+`MSnBase` already support several summarization options and the robust regression summarization available in `msqrobsum` has also been ported into `MSnBase`.
+
+Summarization with MSnBase returns a MSnSet object
+```{r, cache= TRUE}
+protset <- suppressWarnings(combineFeatures(set,fun="robust", groupBy = fData(set)$protein))
+```
+Summarization is also available immediatily from the `msqrobsum` package.
+The advantage of `msqrobsum` is that it offers parallelization useful for robust summarization of very large datasets.
+
+`msqrobsum` accepts both `MSnSet` as `data.frame` objects as input and gives a dataframe with the results as output. 
+when you use a `data.frame` as input it should minimaly contain the columns `expression` (log intensities), `sample`, `feature` (peptide ids) and `protein`(protein ids). 
+An example input data.frame is generated by the function `MSnSet2df()` which converts an `MSnSet()` object to a `data.frame`.
+```{r, cache= TRUE}
+## You can summarize from a MSnSet:
+# protset2 <- msqrobsum( data = set, mode = 'sum', group_vars = 'protein')
+
+## Or from a data.frame:
+set_df = MSnSet2df(set)
+set_df
+protset2 <- suppressWarnings(msqrobsum( data = set_df, mode = 'sum', group_vars = 'protein')) # group_vars indicate which variables you want to group on before summarization
+protset2
+```
+
+# MSqRobSum: MSqRob analysis on the summarized values
+`msqrobsum()` accepts both a `data.frame` and a `MSnSet` object with protein summaries.
+Here, we provide the protein summaries as estimated by robust regression, but we can start from any other protein summares (eg. MaxLFQ values calculated by Maxquant).
+We also need to provide the model to be fitted on the data using the `formulas` parameter.
+We want to model for each protein, the log_{2} intensities in function of the treatment condition of the sample: `expression ~ (1 | condition)`. There will be a parameter estimated for each condition. This is a fairly simple model but you can easily include additional parameters if you need to correct for other effects. For example, if some samples where processed in a different lab (different people, different instruments, ...) it could be beneficial to include a `lab` effect in the model: `expression ~ (1 | condition) + (1 | lab)`.
+We have also indicated that we want to have shrinkage one the `condition` parameter by putting it between brackets (`(1 | condition)` instead of `condition`). If there are too few data points with too much variability, the different condition parameters will be shrunk towards zero.
+Lastely we also have to specify for what contrasts we want test for differential expression.
+We want to test for differential expression between every spike-in condition, so we can just specify this by providing the name of the parameter: `'condition'`.
+You can also provide your own contrast matrix.
+
+```{r, cache= TRUE}
+msqrobsum_result <- msqrobsum(data = set, expression ~ (1 | condition)
+                              , contrasts = 'condition', mode = 'msqrob')
+msqrobsum_result
+```
+
+# MSqRobSum: protein summarization and MSqRob analysis in 1 step.
+`msqrobsum()` also allows to do the summarization and MSqRob analysis together.
+The biggest advantage is that we can make optimal use of the parralization provided by `msqrobsum()` reducing the overal run time.
+
+```{r, cache= TRUE}
+msqrobsum_result <- msqrobsum(data = protset, expression ~ (1 | condition)
+                              , contrasts = 'condition', mode = 'msqrobsum'
+                              ## group by folowing variables,
+                              ## they will also be retained in output
+                              , group_vars = c('protein','human','ecoli'))
+msqrobsum_result
+```
+We can check how many proteins are significantly differentially expressed at 5% FDR.
+Since this is a benchmark dataset we can also check if msqrobsum correctly controlls at the 5% level by calculating the false discovery proportion. This is the percentage human proteins (non differentially expressed) that we retain at 5% FDR.
+
+```{r, cache= TRUE}
+contrasts = msqrobsum_result %>% select(protein,human,contrasts) %>% unnest
+
+filter(contrasts,qvalue <.05) %>% group_by(contrast) %>% 
+  summarise(hits = n(), FDP = round(mean(human),3))
+
+```
+We see that only the FDR for contrast `conditione-conditiona` is not correctly controlled.
+However this can be explained due to ion competion. The is a huge difference is total protein concentration between condition `a` and `e` (big spike-in concentration difference).
+As a result, human peptides in condition `e` are overall ionized less then human peptides in condition `a` (because they have to compete with more E. coli peptides for ionization). The human peptides in condition `e` have on average a lower measured intensity and falsily appear to be less abundant then the human protein in condition `a`.
+
+We can also easily check which proteins are significantly diffentially expressed in a certain condition.
+
+```{r, cache= TRUE}
+msqrobsum_ab = filter(contrasts, qvalue < .05, contrast == 'conditionb-conditiona')
+msqrobsum_ab
+```
+
+
+# MSqRob analysis on peptide intensities 
+We can also use the `msqrobsum()` function to perform a MSqRob analysis on peptide intensities without first summarizing to protein summaries.
+Because a protein can have intensities from multiple peptides and the intensities belonging to 1 peptide are correlated with eachother whe have to account for this in our model.
+Previously we only had 1 protein summary per sample but now we have multiple peptide intensities per sample and these are also correlated with eachother.
+Hence our model: `expression ~ (1|condition) + (1|sample) + (1|feature)`.
+However some proteins will only have intensities from 1 peptide and the model fitting wil fail if we try to use the model above. For these proteins we should use te reduced model `expression ~ (1|condition)`. `msqrobsum()`
+The  `formulas ` parameter accepts a vector of formulas. Model fitting with the first model will be attempted first but if that fails it tries the second model and so on.
+```{r, cache= TRUE}
+formulas =  c(expression ~ (1|condition) + (1|sample) + (1|feature)
+            , expression ~ (1|condition))
+
+msqrob_result <- msqrobsum(data = set, formulas, contrasts = 'condition', mode = 'msqrob'
+                            ## group by folowing variables,
+                            ## they will also be retained in output
+                          , group_vars = c('protein','human','ecoli'))
+msqrob_result
+```
+We check how many proteins are significantly differentially expressed at 5% FDR.
+
+
+```{r, cache= TRUE}
+contrasts = msqrob_result %>% select(protein,human,contrasts) %>% unnest
+
+filter(contrasts,qvalue <.05) %>% group_by(contrast) %>% 
+  summarise(hits = n(), FDP = round(mean(human),3))
+
+```
+We see again that only the FDR for contrast `conditione-conditiona` is not correctly controlled due to ion competion.
+
+We can easily check which proteins are significantly diffentially expressed in a certain condition.
+
+```{r, cache= TRUE}
+msqrob_ab = filter(contrasts, qvalue < .05, contrast == 'conditionb-conditiona')
+msqrob_ab
+```
+We also check if the proteins that are found by the MSqRob and the MSqRobSum analysis are the same.
+```{r, cache= TRUE}
+bind_rows(transmute(msqrob_ab, protein, method = 'msqrob')
+          , transmute(msqrobsum_ab, protein, method = 'msqrobsum')) %>% 
+  mutate(value = TRUE) %>%
+  spread(method,value,fill = FALSE) %>% 
+  count(msqrob, msqrobsum)
+```
+We see that most proteins found by MSqRob are also found by MSqRobSum.
+
+# sessionInfo()
+
+```{r}
+sessionInfo()
+time_b = Sys.time()
+print(time_b - time_a)
+```
+
+# References

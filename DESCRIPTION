@@ -1,0 +1,20 @@
+Package: msqrobsum
+Title: Robust differential abundance analysis for label-free quantitative proteomics and robust peptide abundance summarization
+Version: 0.0.0.9000
+Authors@R: person("Adriaan", "Sticker", email = "adriaan.sticker@ugent.be", role = c("aut", "cre"))
+Description: Perform robust differential abundance analysis directly on peptide abundances from label-free quantitative proteomics experiment. Or first do a robust summarization on these peptide abundances to protein abundances and perform a robust differential abundance analysis on these summarized protein abundances.
+Depends: R (>= 3.5.2)
+Imports:
+  MASS (>= 7.3.51.1),
+  dplyr (>= 0.7.8),
+  tidyr (>= 0.8.2),
+  purrr (>= 0.2.5),
+  future.apply (>= 1.1.0),
+  lme4 (>= 1.1-20),
+  limma (>= 3.36.5)
+Suggests:
+  Biobase (>= 2.40.0)
+License: Apache License, Version 2.0
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 6.1.1
