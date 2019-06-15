@@ -6,7 +6,23 @@ Label-Free Quantitative mass spectrometry based workflows for differential expre
 This R package allows for both MSqRob and MSqRobSum analysis.
 See the vignette for more information.
 
-If you use this package, please cite:
+## Installation
+
+ You first need to install the [devtools](https://cran.r-project.org/package=devtools) package.
+
+```r
+install.packages("devtools")
+```
+
+Then install saas using the `install_github` function in the
+[devtools](https://cran.r-project.org/package=devtools) package.
+```r
+library(devtools)
+install_github("statOmics/MSqRobSum")
+```
+
+
+## If you use this package, please cite:
 
 Robust summarization and inference in proteome-wide label-free quantification  
 Adriaan Sticker, Ludger Goeminne, Lennart Martens, Lieven Clement  
