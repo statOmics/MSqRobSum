@@ -138,7 +138,7 @@ msqrobsum <- function(
                             , rlm_args = rlm_args, lmer_args =lmer_args
                             , contrasts = contrasts, keep_model = keep_model
                             , formulas = formulas, mode = mode)) %>%
-    unnest(mm)
+    unnest(mm) %>% ungroup
   if (mode == 'sum') return(df)
   ## Return also failed ones afterward
   df_failed <- filter(df, is.na(df))
