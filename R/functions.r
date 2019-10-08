@@ -173,7 +173,7 @@ msqrobsum <- function(
          select(-sigma_post, - df_post) %>%
          group_by(contrast) %>%
          mutate(qvalue = p.adjust(pvalue, method = p_adjust_method)) %>%
-         group_by_at(group_vars) %>% nest(.key = contrasts)
+         group_by_at(group_vars) %>% nest(contrasts = - group_vars)
      } else .} %>%
     select(group_vars, contrasts) %>%
     left_join(select(df, -contrasts),., by = group_vars)
