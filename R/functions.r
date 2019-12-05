@@ -141,8 +141,8 @@ msqrobsum <- function(
     unnest(mm) %>% ungroup
   if (mode == 'sum') return(df)
   ## Return also failed ones afterward
-  df_failed <- filter(df, is.na(df))
-  df <- filter(df, !is.na(df))
+  df_failed <- filter(df, rowSums(is.na(df)) != 0)
+  df <- filter(df, rowSums(is.na(df)) == 0)
   if(!nrow(df)) {warning("No models could be fitted"); return(df_prot_failed)}
   ## Squeeze variance
   df <- mutate(df, sigma_post = sigma, df_prior = 0, sigma_prior = 0)
