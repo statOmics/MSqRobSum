@@ -318,7 +318,7 @@ getVcovBetaBUnscaled <- function(model){
   X <- getME(model,"X")
   Z <- getME(model,"Z")
   vcovInv <- Matrix::crossprod(cbind2(X,Z))
-  Ginv <- Matrix::solve(Matrix::crossprod(getME(model,"Lambda")) +
+  Ginv <- Matrix::solve(Matrix::tcrossprod(getME(model,"Lambda")) +
                         Matrix::Diagonal(ncol(Z),1e-18))
   i <- -seq_len(ncol(X))
   vcovInv[i,i] <- vcovInv[i,i]+Ginv
